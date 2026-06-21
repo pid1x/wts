@@ -1,0 +1,49 @@
+<svg width="820" height="330" viewBox="0 0 820 330" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>wts terminal output</title>
+  <desc>A terminal running wts: worktrees listed with an icon, short name, state and branch</desc>
+
+  <rect x="0" y="0" width="820" height="330" rx="10" fill="#1e1e1e"/>
+  <rect x="0" y="0" width="820" height="34" rx="10" fill="#323233"/>
+  <rect x="0" y="24" width="820" height="10" fill="#323233"/>
+
+  <circle cx="22" cy="17" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="17" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="17" r="6" fill="#28c840"/>
+  <text x="410" y="21" text-anchor="middle" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12" fill="#9b9b9b">wts — -zsh — 100×16</text>
+
+  <text font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" fill="#c5c8c6">
+
+    <tspan x="18" y="62">
+      <tspan fill="#98c379">➜</tspan><tspan>  </tspan><tspan fill="#56b6c2">myapp</tspan><tspan> </tspan><tspan fill="#61afef">git:(</tspan><tspan fill="#e06c75">main</tspan><tspan fill="#61afef">)</tspan><tspan fill="#abb2bf"> wts</tspan>
+    </tspan>
+
+    <tspan y="92" fill="#9b9b9b">
+      <tspan x="60">Worktree</tspan><tspan x="225">State</tspan><tspan x="400">Branch</tspan>
+    </tspan>
+
+    <tspan y="120">
+      <tspan x="18">🏠</tspan><tspan x="60">myapp</tspan><tspan x="225">base</tspan><tspan x="400">main</tspan>
+    </tspan>
+    <tspan y="144">
+      <tspan x="18">🟢</tspan><tspan x="60">myapp-docs</tspan><tspan x="225">PR merged</tspan><tspan x="400">docs/api-reference</tspan>
+    </tspan>
+    <tspan y="168">
+      <tspan x="18">🟢</tspan><tspan x="60">myapp-auth</tspan><tspan x="225">PR ready</tspan><tspan x="400">feat/oauth-login</tspan>
+    </tspan>
+    <tspan y="192">
+      <tspan x="18">🟡</tspan><tspan x="60">myapp-search</tspan><tspan x="225">PR open</tspan><tspan x="400">feat/fuzzy-search</tspan>
+    </tspan>
+    <tspan y="216">
+      <tspan x="18">🔴</tspan><tspan x="60">myapp-cache</tspan><tspan x="225">2 uncommitted</tspan><tspan x="400">feat/redis-cache</tspan>
+    </tspan>
+    <tspan y="240">
+      <tspan x="18">🔴</tspan><tspan x="60">myapp-api</tspan><tspan x="225">3 ahead</tspan><tspan x="400">feat/graphql</tspan>
+    </tspan>
+
+    <tspan x="18" y="276" fill="#9b9b9b">Summary: 3 free, 1 open PR, 2 active</tspan>
+
+    <tspan x="18" y="306">
+      <tspan fill="#98c379">➜</tspan><tspan>  </tspan><tspan fill="#56b6c2">myapp</tspan><tspan> </tspan><tspan fill="#61afef">git:(</tspan><tspan fill="#e06c75">main</tspan><tspan fill="#61afef">)</tspan><tspan fill="#c5c8c6"> █</tspan>
+    </tspan>
+  </text>
+</svg>

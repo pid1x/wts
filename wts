@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# wts - show which git worktrees are free for a new coding agent.
+# Uses git + gh (gh optional for PR state).
+#
+# Intended to be portable across bash 3.2 (macOS /bin/bash) and newer.
+#
+# GREEN  - free (clean, merged PR, or PR ready to merge)
+# YELLOW - open PR (work done, waiting review/merge)
+# RED    - active work (dirty tree, or unpushed commits ahead of default)
+#
+# Output columns: <icon> <worktree name> <state> <branch>
+#   icon  🏠 base checkout · 🟢 free · 🟡 open PR · 🔴 busy
+#   state base | N uncommitted | N ahead | PR open | PR ready | PR merged | clean
+#
+# Usage:
+#   wts [--repo PATH] [--free-only] [--json] [--no-color] [repo-path]
+#
+# --json prints an array of objects, one per worktree, e.g.:
+#   [
+#     {"status":"GREEN","name":"myapp","state":"base","branch":"main",
+#      "path":"/repo","info":"branch=main, clean"}
+#   ]
+#
+# Exit code is 0 even on partial info. Requires: git. gh recommended.
+
+set -euo pipefail
+
+REPO_PATH=""
+FREE_ONLY=false
+OUTPUT_JSON=false
+USE_COLOR=true
+
+# Path of the main (base) worktree, resolved once in main().
+BASE_PATH=""
+
+# Display column widths, grown to fit content in main().
+NAME_W=8
+STATE_W=5
+
+# PID of the background progress spinner (empty when not running).
+SPINNER_PID=""
+
+# Field separator for internal rows. Using a control char (unit separator,
+# 0x1f) means branch names or paths containing '|', spaces, etc. never collide
+# with our delimiter. Octal 037 keeps it bash 3.2 friendly.
+FS=$'\037'
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+wts - worktree availability for coding agents
+
+Usage:
+  wts [-r PATH] [-f] [-j] [-n] [repo-path]
+
+Options:
+  -r, --repo PATH   Repository to scan (default: current git repo or cwd)
+  -f, --free-only   Show only GREEN (available) worktrees
+  -j, --json        Machine readable output (array of objects)
+  -n, --no-color    Disable emoji / color indicators
+  -h, --help        Show help
+
+Columns: <icon> <worktree name> <state> <branch>
+  🏠 base checkout   🟢 free   🟡 open PR   🔴 busy
+
+States:
+  base           the main checkout, clean on the default branch
+  N uncommitted  dirty working tree (N changed files)        -> RED
+  N ahead        clean, commits ahead of default, no PR      -> RED
+  PR open        open PR awaiting review                      -> YELLOW
+  PR ready       open PR approved & mergeable                 -> GREEN
+  PR merged      PR merged, worktree free to reuse           -> GREEN
+  clean          clean, nothing pending                       -> GREEN
+
+gh is optional. Without authenticated gh you still get good RED/GREEN via git.
+EOF
+}
+
+die() {
+  echo "wts: $*" >&2
+  exit 1
+}
+
+# Animated progress spinner on stderr (so stdout / JSON stay clean). Only runs
+# on an interactive terminal; a no-op when piped, redirected, or in CI.
+start_spinner() {
+  [[ -t 2 ]] || return 0
+  local msg="${1:-scanning worktrees}"
+  (
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0 n=${#frames[@]}
+    while :; do
+      printf '\r%s %s ' "${frames[$i]}" "$msg" >&2
+      i=$(( (i + 1) % n ))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+stop_spinner() {
+  [[ -n "${SPINNER_PID:-}" ]] || return 0
+  kill "$SPINNER_PID" 2>/dev/null || true
+  wait "$SPINNER_PID" 2>/dev/null || true
+  SPINNER_PID=""
+  printf '\r\033[K' >&2   # carriage return + erase to end of line
+}
+
+# Escape a string for safe inclusion inside a JSON double-quoted value.
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '%s' "$s"
+}
+
+default_branch() {
+  local repo="$1"
+  local b
+  b=$(git -C "$repo" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)
+  [[ -n "$b" ]] && { printf '%s' "$b"; return; }
+
+  for c in main master develop; do
+    if git -C "$repo" show-ref --verify --quiet "refs/heads/$c" 2>/dev/null ||
+       git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$c" 2>/dev/null; then
+      printf '%s' "$c"; return
+    fi
+  done
+  printf 'main'
+}
+
+# Emit one worktree path per line. The porcelain "worktree <path>" line can
+# contain spaces, so strip the prefix rather than splitting on whitespace.
+# The first line is always the main (base) worktree.
+worktree_paths() {
+  local repo="$1"
+  git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
+}
+
+# Returns "AHEAD BEHIND" (two numbers separated by space). Never fails hard.
+ahead_behind() {
+  local repo="$1" base="$2"
+  local base_ref="" ab
+
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then
+    base_ref="$base"
+  elif git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$base" 2>/dev/null; then
+    base_ref="origin/$base"
+  else
+    printf '0 0'
+    return
+  fi
+
+  ab=$(git -C "$repo" rev-list --left-right --count HEAD..."$base_ref" 2>/dev/null || echo "0 0")
+  printf '%s' "$ab"
+}
+
+# Just check the binary exists — no `gh auth status`, which costs a network
+# round trip. If gh is present but unauthenticated, the pr-list calls below
+# fail fast and quietly, and we fall back to git-only RED/GREEN.
+gh_ready() {
+  have_cmd gh
+}
+
+# Look up the PR for a single branch: "<number>\t<pr_state>\t<review_status>",
+# or empty if none. Targeted `--head <branch>` query, so cost scales with the
+# number of worktrees (a handful) rather than the repo's total PR count. An open
+# PR wins over a merged one. We deliberately skip the `mergeable` field — it
+# makes GitHub test-merge the PR and is very slow.
+# pr_state:      OPEN | MERGED
+# review_status: draft | review_required | changes_requested | ready | merged
+pr_lookup() {
+  local path="$1" branch="$2"
+  gh_ready || return 0
+  [[ -z "$branch" || "$branch" == "HEAD" ]] && return 0
+
+  (cd "$path" && gh pr list --head "$branch" --state all --limit 10 \
+    --json number,state,isDraft,reviewDecision \
+    -q '
+      ( [ .[] | select(.state == "OPEN")   ] | first ) as $open
+      | ( [ .[] | select(.state == "MERGED") ] | first ) as $merged
+      | ( $open // $merged ) as $pr
+      | if $pr == null then empty
+        else [ ($pr.number | tostring),
+               $pr.state,
+               ( if $pr.state == "MERGED" then "merged"
+                 elif $pr.isDraft then "draft"
+                 elif $pr.reviewDecision == "APPROVED" then "ready"
+                 elif $pr.reviewDecision == "CHANGES_REQUESTED" then "changes_requested"
+                 else "review_required" end ) ]
+             | join("\t")
+        end' 2>/dev/null || true)
+}
+
+# Portable split of "A B" into two vars without here-string read in hot path.
+split_two() {
+  # usage: split_two "10 0" var1 var2
+  local val="$1" v1name="$2" v2name="$3"
+  # shellcheck disable=SC2086
+  # We deliberately want word splitting here for the two numbers
+  set -- $val
+  eval "$v1name=\"\${1:-0}\""
+  eval "$v2name=\"\${2:-0}\""
+}
+
+# Row format: status FS name FS state FS branch FS path FS info
+classify() {
+  local path="$1" default="$2"
+  local branch dirty dcount ab ahead behind pr_result pr_num pr_pstate pr_status
+  local is_base="0" name status state info
+
+  name=${path##*/}
+
+  if ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s%s%s%s%s%s%s%s%s%s%s\n' \
+      "UNKNOWN" "$FS" "$name" "$FS" "?" "$FS" "?" "$FS" "$path" "$FS" "not a git dir"
+    return
+  fi
+
+  [[ "$path" == "$BASE_PATH" ]] && is_base="1"
+
+  branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+
+  # One status scan yields both the dirty flag and the file count (cheaper than
+  # two `git status` calls, which matters on large working trees).
+  local porcelain
+  porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
+  if [[ -n "$porcelain" ]]; then
+    dirty="1"
+    dcount=$(printf '%s\n' "$porcelain" | wc -l | tr -d ' ')
+  else
+    dirty="0"
+    dcount=0
+  fi
+
+  ab=$(ahead_behind "$path" "$default")
+  ahead=0
+  behind=0
+  split_two "$ab" ahead behind
+
+  pr_num=""
+  pr_pstate=""
+  pr_status=""
+  # The default branch isn't a feature branch — skip its PR lookup. (It can have
+  # stray PRs with head=<default>, e.g. fork syncs, which would otherwise mislabel
+  # the base worktree as "PR merged" instead of "base".)
+  if [[ "$branch" != "$default" ]]; then
+    pr_result=$(pr_lookup "$path" "$branch" || true)
+    [[ -n "$pr_result" ]] && IFS=$'\t' read -r pr_num pr_pstate pr_status <<< "$pr_result"
+  fi
+
+  # Traffic light.
+  if [[ "$dirty" == "1" ]]; then
+    status="RED"
+  elif [[ "$pr_pstate" == "OPEN" && "$pr_status" == "ready" ]]; then
+    status="GREEN"
+  elif [[ "$pr_pstate" == "OPEN" ]]; then
+    status="YELLOW"
+  elif [[ "$pr_pstate" == "MERGED" ]]; then
+    status="GREEN"
+  elif [[ "$ahead" -gt 0 ]]; then
+    status="RED"
+  else
+    status="GREEN"
+  fi
+
+  # Compact state label (single most relevant fact).
+  if [[ "$is_base" == "1" && "$dirty" == "0" && "$ahead" -eq 0 && -z "$pr_pstate" ]]; then
+    state="base"
+  elif [[ "$dirty" == "1" ]]; then
+    state="${dcount} uncommitted"
+  elif [[ "$pr_pstate" == "OPEN" && "$pr_status" == "ready" ]]; then
+    state="PR ready"
+  elif [[ "$pr_pstate" == "OPEN" ]]; then
+    state="PR open"
+  elif [[ "$pr_pstate" == "MERGED" ]]; then
+    state="PR merged"
+  elif [[ "$ahead" -gt 0 ]]; then
+    state="${ahead} ahead"
+  elif [[ "$behind" -gt 0 ]]; then
+    state="${behind} behind"
+  else
+    state="clean"
+  fi
+
+  # Detailed info string (kept verbose for JSON consumers).
+  info="branch=${branch}"
+  [[ "$dirty" == "1" ]] && info="$info, ${dcount} uncommitted"
+  [[ "$ahead" -gt 0 ]] && info="$info, +${ahead} ahead"
+  [[ "$behind" -gt 0 ]] && info="$info, -${behind} behind"
+  if [[ -n "$pr_num" ]]; then
+    case "${pr_pstate}:${pr_status}" in
+      MERGED:*)               info="$info, PR #${pr_num} merged" ;;
+      OPEN:draft)             info="$info, PR #${pr_num} (draft)" ;;
+      OPEN:changes_requested) info="$info, PR #${pr_num} (changes requested)" ;;
+      OPEN:ready)             info="$info, PR #${pr_num} (ready to merge)" ;;
+      OPEN:*)                 info="$info, PR #${pr_num} (review needed)" ;;
+    esac
+  fi
+  [[ "$dirty" == "0" && "$ahead" -eq 0 && -z "$pr_pstate" ]] && info="$info, clean"
+
+  printf '%s%s%s%s%s%s%s%s%s%s%s\n' \
+    "$status" "$FS" "$name" "$FS" "$state" "$FS" "$branch" "$FS" "$path" "$FS" "$info"
+}
+
+print_human() {
+  local row="$1"
+  local st name state br path info icon
+  IFS="$FS" read -r st name state br path info <<< "$row"
+
+  if $USE_COLOR; then
+    if [[ "$state" == "base" ]]; then
+      icon="🏠"
+    else
+      case "$st" in
+        GREEN)  icon="🟢" ;;
+        YELLOW) icon="🟡" ;;
+        RED)    icon="🔴" ;;
+        *)      icon="❔" ;;
+      esac
+    fi
+    printf '%s  %-*s  %-*s  %s\n' "$icon" "$NAME_W" "$name" "$STATE_W" "$state" "$br"
+  else
+    printf '%-7s %-*s  %-*s  %s\n' "$st" "$NAME_W" "$name" "$STATE_W" "$state" "$br"
+  fi
+}
+
+main() {
+  local arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      -r|--repo)       REPO_PATH="${2:-}"; shift 2 ;;
+      -f|--free-only)  FREE_ONLY=true; shift ;;
+      -j|--json)       OUTPUT_JSON=true; shift ;;
+      -n|--no-color)   USE_COLOR=false; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      *)               if [[ -z "$REPO_PATH" && "$arg" != -* ]]; then REPO_PATH="$arg"; fi; shift ;;
+    esac
+  done
+
+  if [[ -z "$REPO_PATH" ]]; then
+    REPO_PATH="$(pwd)"
+  fi
+
+  # Decorative emoji only make sense on a terminal; drop them when piped.
+  if [[ ! -t 1 ]]; then
+    USE_COLOR=false
+  fi
+
+  if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    die "not a git repo (or parent): $REPO_PATH"
+  fi
+
+  local repo_root
+  repo_root=$(git -C "$REPO_PATH" rev-parse --show-toplevel 2>/dev/null || echo "$REPO_PATH")
+
+  # The default branch is shared across all worktrees, so resolve it once.
+  # (PRs are looked up per worktree branch inside classify, in parallel.)
+  local default
+  default=$(default_branch "$repo_root")
+
+  local paths
+  paths=$(worktree_paths "$repo_root")
+  if [[ -z "$paths" ]]; then
+    paths="$repo_root"
+  fi
+
+  # First worktree line is always the main checkout -> the base.
+  BASE_PATH=$(printf '%s\n' "$paths" | head -1)
+
+  # Show a spinner while we scan (git status + a PR lookup per worktree).
+  trap stop_spinner EXIT INT TERM
+  start_spinner "scanning worktrees"
+
+  # Column widths grow to fit content; seeded with the header label lengths.
+  NAME_W=8   # "Worktree"
+  STATE_W=5  # "State"
+
+  # Classify worktrees concurrently — on a large repo the per-worktree
+  # `git status` dominates, so this is the main speedup. Each row goes to an
+  # index-named temp file so we can reassemble them in (base-first) order.
+  local rows=""
+  local tmpdir
+  tmpdir=$(mktemp -d 2>/dev/null || true)
+  if [[ -n "$tmpdir" ]]; then
+    local idx=0 running=0 maxj=8 f pids=""
+    while IFS= read -r p || [[ -n "$p" ]]; do
+      [[ -z "$p" ]] && continue
+      classify "$p" "$default" > "$tmpdir/$(printf '%06d' "$idx")" 2>/dev/null &
+      pids="$pids $!"
+      idx=$((idx + 1))
+      running=$((running + 1))
+      if [[ "$running" -ge "$maxj" ]]; then
+        # Wait on this batch's PIDs only (never the spinner's).
+        # shellcheck disable=SC2086
+        wait $pids 2>/dev/null || true
+        pids=""
+        running=0
+      fi
+    done <<< "$paths"
+    # shellcheck disable=SC2086
+    [[ -n "$pids" ]] && { wait $pids 2>/dev/null || true; }
+    for f in "$tmpdir"/*; do
+      [[ -f "$f" ]] || continue
+      rows="$rows$(cat "$f")"$'\n'
+    done
+    rm -rf "$tmpdir"
+  else
+    # Fallback: sequential if mktemp is unavailable.
+    local row
+    while IFS= read -r p || [[ -n "$p" ]]; do
+      [[ -z "$p" ]] && continue
+      row=$(classify "$p" "$default") || continue
+      rows="$rows$row"$'\n'
+    done <<< "$paths"
+  fi
+
+  # Count (before --free-only filtering, so the summary reflects everything),
+  # then apply the filter.
+  local g=0 y=0 r=0
+  local row st filtered=""
+  while IFS= read -r row || [[ -n "$row" ]]; do
+    [[ -z "$row" ]] && continue
+    st=${row%%"$FS"*}
+    case "$st" in
+      GREEN)  g=$((g + 1)) ;;
+      YELLOW) y=$((y + 1)) ;;
+      RED)    r=$((r + 1)) ;;
+    esac
+    if $FREE_ONLY && [[ "$st" != "GREEN" ]]; then
+      continue
+    fi
+    filtered="$filtered$row"$'\n'
+  done <<< "$rows"
+  rows="$filtered"
+
+  # Scanning is done — clear the spinner before any stdout output.
+  stop_spinner
+
+  if $OUTPUT_JSON; then
+    printf '[\n'
+    local first=true
+    printf '%s' "$rows" | while IFS= read -r row || [[ -n "$row" ]]; do
+      [[ -z "$row" ]] && continue
+      IFS="$FS" read -r st name state br path info <<< "$row"
+      $first || printf ',\n'
+      first=false
+      printf '  {"status":"%s","name":"%s","state":"%s","branch":"%s","path":"%s","info":"%s"}' \
+        "$(json_escape "$st")" "$(json_escape "$name")" "$(json_escape "$state")" \
+        "$(json_escape "$br")" "$(json_escape "$path")" "$(json_escape "$info")"
+    done
+    printf '\n]\n'
+    printf 'Summary: %d free, %d open PR, %d active\n' "$g" "$y" "$r" >&2
+    return
+  fi
+
+  # Size the name/state columns to the widest displayed value.
+  local _s _n _st _rest
+  while IFS="$FS" read -r _s _n _st _rest || [[ -n "$_s$_n$_st" ]]; do
+    [[ -z "$_n" ]] && continue
+    [[ ${#_n}  -gt $NAME_W  ]] && NAME_W=${#_n}
+    [[ ${#_st} -gt $STATE_W ]] && STATE_W=${#_st}
+  done <<< "$rows"
+
+  if $USE_COLOR; then
+    printf '    %-*s  %-*s  %s\n' "$NAME_W" "Worktree" "$STATE_W" "State" "Branch"
+  else
+    printf '%-7s %-*s  %-*s  %s\n' "Status" "$NAME_W" "Worktree" "$STATE_W" "State" "Branch"
+  fi
+
+  printf '%s' "$rows" | while IFS= read -r row || [[ -n "$row" ]]; do
+    [[ -z "$row" ]] && continue
+    print_human "$row"
+  done
+
+  printf '\n'
+  printf 'Summary: %d free, %d open PR, %d active\n' "$g" "$y" "$r"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

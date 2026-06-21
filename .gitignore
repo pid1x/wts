@@ -1,0 +1,11 @@
+# OS
+.DS_Store
+
+# Temporary test artifacts
+/tmp/wts*
+*.tmp
+
+# Editor
+.idea/
+.vscode/
+*.swp
